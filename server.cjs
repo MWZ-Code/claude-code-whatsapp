@@ -34,7 +34,9 @@ const { z } = require("zod");
 // ── Config ──────────────────────────────────────────────────────────
 
 const STATE_DIR = process.env.WHATSAPP_STATE_DIR || path.join(os.homedir(), ".claude", "channels", "whatsapp");
-const ACCESS_FILE = path.join(STATE_DIR, "access.json");
+const ACCESS_FILE = process.env.WHATSAPP_ACCESS_FILE
+  ? path.resolve(process.env.WHATSAPP_ACCESS_FILE.replace(/^~(?=\/|$)/, os.homedir()))
+  : path.join(STATE_DIR, "access.json");
 const AUTH_DIR = path.join(STATE_DIR, "auth");
 const INBOX_DIR = path.join(STATE_DIR, "inbox");
 
@@ -112,6 +114,23 @@ const RAW_MSG_CAP = 500;
 const recentMessages = new Map();
 const MAX_RECENT = 100;
 const seenMessages = new Map();
+
+// Ring buffer of IDs for messages sent by the bot via the reply tool.
+// Entries are excluded from fetch_messages results to prevent echo loops.
+// fromMe already blocks these from entering recentMessages, but this is an
+// explicit guard that survives any Baileys edge-cases around that flag.
+const SENT_RING_CAP = 300;
+const _sentRing = new Array(SENT_RING_CAP).fill(null);
+const _sentSet = new Set();
+let _sentRingIdx = 0;
+
+function trackSentId(id) {
+  const evicted = _sentRing[_sentRingIdx];
+  if (evicted !== null) _sentSet.delete(evicted);
+  _sentRing[_sentRingIdx] = id;
+  _sentSet.add(id);
+  _sentRingIdx = (_sentRingIdx + 1) % SENT_RING_CAP;
+}
 const SEEN_TTL = 20 * 60 * 1000;
 const SEEN_MAX = 5000;
 
@@ -490,6 +509,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: "string" },
           reply_to: { type: "string", description: "Message ID to quote-reply to." },
           files: { type: "array", items: { type: "string" }, description: "Absolute file paths to attach." },
+          agent_message: { type: "boolean", description: "When true, the sent message ID is not tracked in the dedup filter — fetch_messages can then observe it (used in diagnostic / round-trip testing)." },
         },
         required: ["chat_id", "text"],
       },
@@ -539,7 +559,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           if (fs.statSync(f).size > 64 * 1024 * 1024) throw new Error(`file too large: ${f}`);
         }
         const quoted = args.reply_to ? rawMessages.get(args.reply_to) : undefined;
-        if (text) await sock.sendMessage(chatId, { text }, quoted ? { quoted } : undefined);
+        let sentId = null;
+        if (text) {
+          const sent = await sock.sendMessage(chatId, { text }, quoted ? { quoted } : undefined);
+          sentId = sent?.key?.id ?? null;
+          if (sentId && !args.agent_message) {
+            trackSentId(sentId);
+          } else if (sentId && args.agent_message) {
+            // Store directly in recentMessages so fetch_messages can observe it
+            // (fromMe=true messages are skipped by the Baileys event handler, so
+            //  we inject the entry here for round-trip / diagnostic testing)
+            storeRecent(chatId, {
+              id: sentId,
+              from: "bot",
+              text,
+              ts: Date.now(),
+              hasMedia: false,
+              mediaType: undefined,
+            });
+          }
+        }
         for (const f of files) {
           const ext = path.extname(f).toLowerCase();
           const buf = fs.readFileSync(f);
@@ -553,7 +592,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             await sock.sendMessage(chatId, { document: buf, mimetype: "application/octet-stream", fileName: path.basename(f) });
           }
         }
-        return { content: [{ type: "text", text: "sent" }] };
+        return { content: [{ type: "text", text: sentId ? `sent:${sentId}` : "sent" }] };
       }
       case "react": {
         await sock.sendMessage(args.chat_id, {
@@ -576,7 +615,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "fetch_messages": {
         const limit = Math.min(args.limit || 20, 100);
         const msgs = recentMessages.get(args.chat_id) || [];
-        const slice = msgs.slice(-limit);
+        const slice = msgs.filter(m => !_sentSet.has(m.id)).slice(-limit);
         if (slice.length === 0) return { content: [{ type: "text", text: "(no messages in session cache)" }] };
         const out = slice.map((m) => `[${new Date(m.ts).toISOString()}] ${m.from}: ${m.text}  (id: ${m.id}${m.hasMedia ? ` +${m.mediaType}` : ""})`).join("\n");
         return { content: [{ type: "text", text: out }] };
