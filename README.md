@@ -94,13 +94,30 @@ Create `~/.claude/channels/whatsapp/access.json`:
   "allowFrom": ["5511999999999"],
   "allowGroups": false,
   "allowedGroups": [],
-  "requireAllowFromInGroups": false
+  "requireAllowFromInGroups": false,
+  "mentionKey": null
 }
 ```
 
-- `allowFrom: []` (empty) = accept messages from anyone
-- `allowFrom: ["5511999999999"]` = only from this number
-- `allowGroups: true` + `allowedGroups: ["xxx@g.us"]` = specific groups
+| Field | Default | Description |
+|-------|---------|-------------|
+| `allowFrom` | `[]` | Phone numbers allowed to DM the bot. Empty = anyone. |
+| `allowGroups` | `false` | Whether the bot listens to group chats at all. |
+| `allowedGroups` | `[]` | Specific group JIDs to allow (when `allowGroups: true`). Empty = all groups. |
+| `requireAllowFromInGroups` | `false` | When `true`, group messages are only processed if the sender is in `allowFrom`. |
+| `mentionKey` | `null` | Regex pattern (case-insensitive). When set, group messages are only processed if their text matches this pattern. DMs are never filtered. |
+
+Changes to `access.json` take effect immediately — no restart required.
+
+#### Mention key
+
+The `mentionKey` field is a JavaScript regex string applied case-insensitively to every inbound group message. Only messages whose text matches are forwarded to Claude; everything else is silently ignored.
+
+```json
+{ "mentionKey": "@pricebot|hey pricebot" }
+```
+
+> **⚠️ Choose a low-collision pattern.** A pattern like `\bb\b` or `ok` will match too many ordinary messages and make the bot noisy. Use a short, unique string — e.g. your bot's handle or a distinctive prefix — so accidental triggers are rare.
 
 ## Tools
 
@@ -154,6 +171,9 @@ This plugin was rewritten based on analysis of [OpenClaw's WhatsApp extension](h
 | creds.json corrupted | Crash during save | v0.0.3 restores from backup automatically |
 
 ## Changelog
+
+### v0.0.4 (2026-04-24)
+- **Mention-key trigger** — new `mentionKey` field in `access.json`: a case-insensitive regex that gates group messages. Only messages whose text matches are forwarded to Claude; DMs are unaffected. Invalid patterns fall back to no filter with a logged warning. Hot-reload supported.
 
 ### v0.0.3 (2026-03-24)
 - **Breaking:** Rewrote connection lifecycle based on OpenClaw patterns

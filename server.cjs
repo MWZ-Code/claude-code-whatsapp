@@ -58,18 +58,34 @@ const HEALTHY_THRESHOLD = 60 * 1000;     // 60s connected = healthy (reset backo
 // ── Access Control ──────────────────────────────────────────────────
 
 function defaultAccess() {
-  return { allowFrom: [], allowGroups: false, allowedGroups: [], requireAllowFromInGroups: false };
+  return { allowFrom: [], allowGroups: false, allowedGroups: [], requireAllowFromInGroups: false, mentionKey: null };
 }
 
 function loadAccess() {
+  let access;
   try {
     const parsed = JSON.parse(fs.readFileSync(ACCESS_FILE, "utf8"));
-    return { ...defaultAccess(), ...parsed };
+    access = { ...defaultAccess(), ...parsed };
   } catch (err) {
-    if (err.code === "ENOENT") return defaultAccess();
-    try { fs.renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`); } catch {}
-    return defaultAccess();
+    if (err.code !== "ENOENT") {
+      try { fs.renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`); } catch {}
+    }
+    access = defaultAccess();
   }
+  // Compile mentionKey regex once; fall back to null on invalid pattern
+  if (access.mentionKey && typeof access.mentionKey === "string") {
+    try {
+      access._mentionRe = new RegExp(access.mentionKey, "i");
+    } catch {
+      log(`access.json: invalid mentionKey regex "${access.mentionKey}" — disabling mention filter`);
+      access.mentionKey = null;
+      access._mentionRe = null;
+    }
+  } else {
+    access.mentionKey = null;
+    access._mentionRe = null;
+  }
+  return access;
 }
 
 function toJid(phone) {
@@ -77,8 +93,7 @@ function toJid(phone) {
   return `${phone.replace(/[^0-9]/g, "")}@s.whatsapp.net`;
 }
 
-function isAllowed(jid, participant) {
-  const access = loadAccess();
+function isAllowed(access, jid, participant) {
   const isGroup = jid.endsWith("@g.us");
   if (isGroup) {
     if (!access.allowGroups) return false;
@@ -375,7 +390,15 @@ async function connectWhatsApp() {
       const participant = msg.key.participant;
 
       if (msgId && isDuplicate(`${jid}:${msgId}`)) continue;
-      if (!isAllowed(jid, participant || undefined)) continue;
+
+      const access = loadAccess();
+      if (!isAllowed(access, jid, participant || undefined)) continue;
+
+      // Mention-key filter: group messages must match the regex (case-insensitive)
+      if (jid.endsWith("@g.us") && access._mentionRe) {
+        const text = extractText(msg.message);
+        if (!access._mentionRe.test(text)) continue;
+      }
 
       try { await sock.readMessages([msg.key]); } catch {}
 
