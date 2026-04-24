@@ -115,6 +115,12 @@ const recentMessages = new Map();
 const MAX_RECENT = 100;
 const seenMessages = new Map();
 
+// Server-side delivery cursor — tracks the last arrivedAt timestamp delivered
+// to the bot via fetch_messages, per chat. Only messages arriving AFTER the
+// cursor are returned on each call, eliminating reliance on Claude's in-context
+// deduplication (which breaks after context compression).
+const lastDeliveredAt = new Map();
+
 // Ring buffer of IDs for messages sent by the bot via the reply tool.
 // Entries are excluded from fetch_messages results to prevent echo loops.
 // fromMe already blocks these from entering recentMessages, but this is an
@@ -241,9 +247,18 @@ async function connectWhatsApp() {
   // Restore creds from backup if corrupted
   maybeRestoreCredsFromBackup();
 
-  const authState = await useMultiFileAuthState(AUTH_DIR);
-  saveCreds = authState.saveCreds;
-  const { version } = await fetchLatestBaileysVersion();
+  let authState, version;
+  try {
+    authState = await useMultiFileAuthState(AUTH_DIR);
+    saveCreds = authState.saveCreds;
+    ({ version } = await fetchLatestBaileysVersion());
+  } catch (err) {
+    const delay = computeDelay(retryCount);
+    retryCount++;
+    log(`connectWhatsApp init error: ${err} — retrying in ${delay}ms (attempt ${retryCount})`);
+    setTimeout(connectWhatsApp, delay);
+    return;
+  }
 
   sock = makeWASocket({
     auth: {
@@ -345,13 +360,18 @@ async function connectWhatsApp() {
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     for (const msg of messages) {
       if (!msg.message) continue;
-      if (msg.key.fromMe) continue;
+
+      const msgId = msg.key.id;
+
+      // Skip only messages the bot itself sent (tracked in _sentSet).
+      // Do NOT do a blanket fromMe filter — WZ messages from their own phone
+      // also arrive as fromMe:true on a linked-device session.
+      if (msg.key.fromMe && msgId && _sentSet.has(msgId)) continue;
 
       const jid = msg.key.remoteJid;
       if (!jid) continue;
       if (jid.endsWith("@broadcast") || jid.endsWith("@status")) continue;
 
-      const msgId = msg.key.id;
       const participant = msg.key.participant;
 
       if (msgId && isDuplicate(`${jid}:${msgId}`)) continue;
@@ -412,10 +432,12 @@ async function handleInbound(msg, jid, participant) {
   const senderJid = participant || jid;
   const senderNumber = formatJid(senderJid);
 
+  const arrivedAt = Date.now();
   storeRecent(jid, {
     id: msgId, from: senderNumber,
     text: text || (media ? `(${media.type})` : ""),
     ts: (Number(msg.messageTimestamp) || Date.now() / 1000) * 1000,
+    arrivedAt,
     hasMedia: !!media, mediaType: media?.type,
   });
 
@@ -501,13 +523,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "reply",
-      description: "Reply on WhatsApp. Pass chat_id from the inbound message.",
+      description: "Send or edit a WhatsApp message. Pass chat_id from the inbound message. To edit a previously sent message (e.g. replace a 'Working on…' placeholder with the final answer), pass edit with the message ID returned from the original send.",
       inputSchema: {
         type: "object",
         properties: {
           chat_id: { type: "string", description: "WhatsApp JID" },
           text: { type: "string" },
-          reply_to: { type: "string", description: "Message ID to quote-reply to." },
+          edit: { type: "string", description: "Message ID to edit. When set, updates that existing message instead of sending a new one. Only works on messages previously sent by the bot." },
+          reply_to: { type: "string", description: "Message ID to quote-reply to (ignored when edit is set)." },
           files: { type: "array", items: { type: "string" }, description: "Absolute file paths to attach." },
           send_as_document: { type: "boolean", description: "When true, send all files as documents regardless of extension — preserves quality, bypasses WhatsApp image compression." },
           agent_message: { type: "boolean", description: "When true, the sent message ID is not tracked in the dedup filter — fetch_messages can then observe it (used in diagnostic / round-trip testing)." },
@@ -535,7 +558,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "fetch_messages",
-      description: "Fetch recent messages from a WhatsApp chat (session cache only).",
+      description: "Fetch new messages from a WhatsApp chat since the last call (server-side cursor). Returns only messages not yet delivered to the bot — calling it twice returns different sets. Pass limit to cap results.",
       inputSchema: {
         type: "object",
         properties: { chat_id: { type: "string" }, limit: { type: "number" } },
@@ -567,6 +590,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true
           };
         }
+        // Edit path: update an existing bot message instead of sending new.
+        if (args.edit) {
+          const editKey = { remoteJid: chatId, fromMe: true, id: args.edit };
+          await sock.sendMessage(chatId, { text, edit: editKey });
+          return { content: [{ type: "text", text: `edited:${args.edit}` }] };
+        }
+
         let sentId = null;
         if (text) {
           const sent = await sock.sendMessage(chatId, { text }, quoted ? { quoted } : undefined);
@@ -624,9 +654,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       case "fetch_messages": {
         const limit = Math.min(args.limit || 20, 100);
+        const cursor = lastDeliveredAt.get(args.chat_id) || 0;
         const msgs = recentMessages.get(args.chat_id) || [];
-        const slice = msgs.filter(m => !_sentSet.has(m.id)).slice(-limit);
-        if (slice.length === 0) return { content: [{ type: "text", text: "(no messages in session cache)" }] };
+        const slice = msgs
+          .filter(m => !_sentSet.has(m.id) && (m.arrivedAt || m.ts) > cursor)
+          .slice(-limit);
+        if (slice.length > 0) {
+          lastDeliveredAt.set(args.chat_id, Math.max(...slice.map(m => m.arrivedAt || m.ts)));
+        }
+        if (slice.length === 0) return { content: [{ type: "text", text: "(no new messages)" }] };
         const out = slice.map((m) => `[${new Date(m.ts).toISOString()}] ${m.from}: ${m.text}  (id: ${m.id}${m.hasMedia ? ` +${m.mediaType}` : ""})`).join("\n");
         return { content: [{ type: "text", text: out }] };
       }
