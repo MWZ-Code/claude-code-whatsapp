@@ -509,6 +509,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: "string" },
           reply_to: { type: "string", description: "Message ID to quote-reply to." },
           files: { type: "array", items: { type: "string" }, description: "Absolute file paths to attach." },
+          send_as_document: { type: "boolean", description: "When true, send all files as documents regardless of extension — preserves quality, bypasses WhatsApp image compression." },
           agent_message: { type: "boolean", description: "When true, the sent message ID is not tracked in the dedup filter — fetch_messages can then observe it (used in diagnostic / round-trip testing)." },
         },
         required: ["chat_id", "text"],
@@ -559,6 +560,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           if (fs.statSync(f).size > 64 * 1024 * 1024) throw new Error(`file too large: ${f}`);
         }
         const quoted = args.reply_to ? rawMessages.get(args.reply_to) : undefined;
+        const MAX_TEXT = parseInt(process.env.WHATSAPP_MAX_TEXT_CHARS || "4096");
+        if (text && text.length > MAX_TEXT && !args.agent_message) {
+          return {
+            content: [{ type: "text", text: `text too long: ${text.length} chars (limit ${MAX_TEXT}). Use render_report.py and send as document instead.` }],
+            isError: true
+          };
+        }
         let sentId = null;
         if (text) {
           const sent = await sock.sendMessage(chatId, { text }, quoted ? { quoted } : undefined);
@@ -582,7 +590,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         for (const f of files) {
           const ext = path.extname(f).toLowerCase();
           const buf = fs.readFileSync(f);
-          if ([".jpg", ".jpeg", ".png", ".gif", ".webp"].includes(ext)) {
+          if (args.send_as_document === true) {
+            await sock.sendMessage(chatId, { document: buf, mimetype: "image/png", fileName: path.basename(f) });
+          } else if ([".jpg", ".jpeg", ".png", ".gif", ".webp"].includes(ext)) {
             await sock.sendMessage(chatId, { image: buf });
           } else if ([".ogg", ".mp3", ".m4a", ".wav"].includes(ext)) {
             await sock.sendMessage(chatId, { audio: buf, mimetype: ext === ".ogg" ? "audio/ogg; codecs=opus" : "audio/mpeg", ptt: ext === ".ogg" });
