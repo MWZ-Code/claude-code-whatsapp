@@ -16,14 +16,24 @@
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { ListToolsRequestSchema, CallToolRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
-const {
-  makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  downloadMediaMessage,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-} = require("@whiskeysockets/baileys");
+// Baileys is ESM-only (>=7.x) and cannot be require()'d from a .cjs file.
+// Bindings are populated by loadBaileys() before mcp.connect() in main().
+let makeWASocket;
+let useMultiFileAuthState;
+let DisconnectReason;
+let downloadMediaMessage;
+let fetchLatestBaileysVersion;
+let makeCacheableSignalKeyStore;
+
+async function loadBaileys() {
+  const m = await import("@whiskeysockets/baileys");
+  makeWASocket = m.default ?? m.makeWASocket;
+  useMultiFileAuthState = m.useMultiFileAuthState;
+  DisconnectReason = m.DisconnectReason;
+  downloadMediaMessage = m.downloadMediaMessage;
+  fetchLatestBaileysVersion = m.fetchLatestBaileysVersion;
+  makeCacheableSignalKeyStore = m.makeCacheableSignalKeyStore;
+}
 const pino = require("pino");
 const qrcode = require("qrcode-terminal");
 const fs = require("fs");
@@ -733,6 +743,7 @@ process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
 async function main() {
+  await loadBaileys();
   await mcp.connect(new StdioServerTransport());
   connectWhatsApp();
 }

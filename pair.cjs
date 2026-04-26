@@ -1,16 +1,27 @@
 #!/usr/bin/env node
 // Standalone WhatsApp pairing — run from plugin dir for node_modules
 // Usage: cd ~/.claude/plugins/cache/nexus-plugins/whatsapp/0.0.1 && node ~/nexus/scripts/whatsapp-pair.cjs
-const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, fetchLatestBaileysVersion, DisconnectReason } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
 const pino = require("pino");
 
-const AUTH_DIR = "/Users/stent/.claude/channels/whatsapp/auth";
+const path = require("path");
+const os = require("os");
+const STATE_DIR = (process.env.WHATSAPP_STATE_DIR || path.join(os.homedir(), ".claude", "channels", "whatsapp"))
+  .replace(/^~(?=\/|$)/, os.homedir());
+const AUTH_DIR = path.join(STATE_DIR, "auth");
 
 console.log("WhatsApp pairing — auth dir:", AUTH_DIR);
 console.log("Connecting...\n");
 
 (async () => {
+  const baileys = await import("@whiskeysockets/baileys");
+  const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    makeCacheableSignalKeyStore,
+    fetchLatestBaileysVersion,
+    DisconnectReason,
+  } = baileys;
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
   const logger = pino({ level: "silent" });
@@ -26,11 +37,13 @@ console.log("Connecting...\n");
 
   sock.ev.on("creds.update", saveCreds);
 
-  // Request pairing code (phone-based, no QR scan needed)
-  if (!state.creds.registered) {
+  // Request pairing code (phone-based, no QR scan needed). Set $PAIR_PHONE
+  // to your number (digits only, country code first, no '+'). If unset, skip
+  // straight to QR — server logs will show the QR.
+  if (!state.creds.registered && process.env.PAIR_PHONE) {
     setTimeout(async () => {
       try {
-        const code = await sock.requestPairingCode("556281955400");
+        const code = await sock.requestPairingCode(process.env.PAIR_PHONE);
         console.log(`\n📱 PAIRING CODE: ${code}\n`);
         console.log("WhatsApp > Linked Devices > Link a Device > Link with phone number");
         console.log("Enter the code above.\n");
