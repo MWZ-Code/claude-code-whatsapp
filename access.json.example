@@ -1,0 +1,6 @@
+{
+  "allowFrom": ["15551234567"],
+  "allowGroups": true,
+  "allowedGroups": ["1234567890-1234567890@g.us"],
+  "requireAllowFromInGroups": false
+}
