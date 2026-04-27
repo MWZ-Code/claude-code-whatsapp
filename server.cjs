@@ -49,12 +49,14 @@ const ACCESS_FILE = process.env.WHATSAPP_ACCESS_FILE
   : path.join(STATE_DIR, "access.json");
 const AUTH_DIR = path.join(STATE_DIR, "auth");
 const INBOX_DIR = path.join(STATE_DIR, "inbox");
+const TRACE = process.env.WHATSAPP_TRACE === "1" || process.env.WHATSAPP_TRACE === "true";
 
 fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
 fs.mkdirSync(INBOX_DIR, { recursive: true });
 
 const logger = pino({ level: "silent" });
 const log = (msg) => process.stderr.write(`whatsapp channel: ${msg}\n`);
+const trace = TRACE ? (msg) => process.stderr.write(`whatsapp trace: ${msg}\n`) : () => {};
 
 // Permission-reply spec from claude-cli-internal channelPermissions.ts
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
@@ -387,29 +389,40 @@ async function connectWhatsApp() {
       if (!msg.message) continue;
 
       const msgId = msg.key.id;
+      const jid = msg.key.remoteJid;
+      if (!jid) continue;
+      const participant = msg.key.participant;
+
+      if (TRACE) {
+        const kind = jid.endsWith("@g.us") ? "group"
+          : jid.endsWith("@broadcast") ? "broadcast"
+          : jid.endsWith("@status") ? "status"
+          : "dm";
+        const preview = extractText(msg.message).slice(0, 80).replace(/\s+/g, " ");
+        const who = participant ? ` participant=${participant}` : "";
+        const self = msg.key.fromMe ? " (self)" : "";
+        trace(`inbound${self} ${kind} jid=${jid}${who} id=${msgId} text=${JSON.stringify(preview)}`);
+      }
 
       // Skip only messages the bot itself sent (tracked in _sentSet).
       // Do NOT do a blanket fromMe filter — WZ messages from their own phone
       // also arrive as fromMe:true on a linked-device session.
-      if (msg.key.fromMe && msgId && _sentSet.has(msgId)) continue;
+      if (msg.key.fromMe && msgId && _sentSet.has(msgId)) { trace("  drop: bot's own reply"); continue; }
 
-      const jid = msg.key.remoteJid;
-      if (!jid) continue;
-      if (jid.endsWith("@broadcast") || jid.endsWith("@status")) continue;
+      if (jid.endsWith("@broadcast") || jid.endsWith("@status")) { trace("  drop: broadcast/status"); continue; }
 
-      const participant = msg.key.participant;
-
-      if (msgId && isDuplicate(`${jid}:${msgId}`)) continue;
+      if (msgId && isDuplicate(`${jid}:${msgId}`)) { trace("  drop: duplicate within dedup window"); continue; }
 
       const access = loadAccess();
-      if (!isAllowed(access, jid, participant || undefined)) continue;
+      if (!isAllowed(access, jid, participant || undefined)) { trace("  drop: blocked by access.json"); continue; }
 
       // Mention-key filter: group messages must match the regex (case-insensitive)
       if (jid.endsWith("@g.us") && access._mentionRe) {
         const text = extractText(msg.message);
-        if (!access._mentionRe.test(text)) continue;
+        if (!access._mentionRe.test(text)) { trace("  drop: mentionKey regex no match"); continue; }
       }
 
+      trace("  accept");
       try { await sock.readMessages([msg.key]); } catch {}
 
       lastInboundAt = Date.now();

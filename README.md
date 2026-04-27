@@ -158,6 +158,33 @@ This plugin was rewritten based on analysis of [OpenClaw's WhatsApp extension](h
 | Creds backup | Auto-backup before each save. Auto-restore if JSON is corrupted |
 | Listener cleanup | Remove all event listeners before creating new socket (prevents leaks) |
 
+## Debugging
+
+Set `WHATSAPP_TRACE=1` to log every inbound message and the decision applied
+to it (accept / drop reason). Trace lines go to stderr and are prefixed
+`whatsapp trace:`. Disabled by default — zero overhead when off.
+
+```bash
+WHATSAPP_TRACE=1 WHATSAPP_STATE_DIR=~/.claude/channels/whatsapp \
+  node server.cjs 2>&1 | grep '^whatsapp trace:'
+```
+
+Each inbound message produces two lines: the `inbound …` line classifies the
+chat (`dm` / `group` / `broadcast` / `status`) and shows the JID, sender
+participant (groups only), message id, and an 80-char text preview; the
+indented follow-up line shows the decision (`accept` or `drop: <reason>`).
+
+**Finding a group's JID.** Group JIDs look like `1234567890-1234567890@g.us`
+and aren't exposed in the WhatsApp UI. With trace enabled, send any message
+in the target group and grep:
+
+```bash
+WHATSAPP_TRACE=1 node server.cjs 2>&1 | grep 'whatsapp trace: inbound group'
+```
+
+The first hit gives you the JID to paste into `access.json` under
+`allowedGroups`.
+
 ## Troubleshooting
 
 | Issue | Cause | Solution |
@@ -171,6 +198,9 @@ This plugin was rewritten based on analysis of [OpenClaw's WhatsApp extension](h
 | creds.json corrupted | Crash during save | v0.0.3 restores from backup automatically |
 
 ## Changelog
+
+### v0.0.5 (2026-04-27)
+- **Trace logging** — set `WHATSAPP_TRACE=1` to log every inbound message and the decision applied (accept or drop-with-reason). Zero overhead when off. See the Debugging section, including the recipe for discovering group JIDs.
 
 ### v0.0.4 (2026-04-24)
 - **Mention-key trigger** — new `mentionKey` field in `access.json`: a case-insensitive regex that gates group messages. Only messages whose text matches are forwarded to Claude; DMs are unaffected. Invalid patterns fall back to no filter with a logged warning. Hot-reload supported.

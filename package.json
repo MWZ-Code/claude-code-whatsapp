@@ -1,6 +1,6 @@
 {
   "name": "claude-channel-whatsapp",
-  "version": "0.0.3",
+  "version": "0.0.5",
   "license": "MIT",
   "bin": "./server.cjs",
   "scripts": {
