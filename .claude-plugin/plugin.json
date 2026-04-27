@@ -1,11 +1,11 @@
 {
   "name": "whatsapp",
-  "description": "WhatsApp channel for Claude Code — messaging bridge via Baileys (WhatsApp Web Multi-Device) with built-in access control.",
-  "version": "0.0.1",
+  "description": "WhatsApp channel for Claude Code — long-running HTTP server (Baileys / WhatsApp Web Multi-Device) with built-in access control. Consumed via plain HTTP on loopback; the bundled whatsapp-channel skill documents the contract.",
+  "version": "0.1.0",
   "keywords": [
     "whatsapp",
     "messaging",
     "channel",
-    "mcp"
+    "http"
   ]
 }
