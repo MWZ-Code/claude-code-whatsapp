@@ -1,17 +1,15 @@
 {
   "name": "claude-channel-whatsapp",
-  "version": "0.0.5",
+  "version": "0.1.0",
   "license": "MIT",
   "bin": "./server.cjs",
   "scripts": {
     "start": "node server.cjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
     "@whiskeysockets/baileys": "7.0.0-rc.9",
     "link-preview-js": "^4.0.0",
     "pino": "^9.0.0",
-    "qrcode-terminal": "^0.12.0",
-    "zod": "^3.22.0"
+    "qrcode-terminal": "^0.12.0"
   }
 }

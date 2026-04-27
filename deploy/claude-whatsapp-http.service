@@ -1,0 +1,37 @@
+[Unit]
+Description=Claude WhatsApp Channel (HTTP)
+Documentation=https://github.com/MWZ-Code/claude-code-whatsapp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKING_DIR@
+
+# Path so the right Node 22+ binary is found (Baileys 7.x needs ESM-capable Node).
+Environment=PATH=@PATH@
+
+# Where the channel keeps creds, inbox, access.json.
+Environment=WHATSAPP_STATE_DIR=@STATE_DIR@
+
+# HTTP bind. Loopback by default; override here if you need to expose it.
+Environment=WHATSAPP_HTTP_BIND=127.0.0.1
+Environment=WHATSAPP_HTTP_PORT=8787
+
+ExecStart=@NODE_BIN@ @WORKING_DIR@/server.cjs
+
+Restart=on-failure
+RestartSec=5
+# Cap restarts to avoid a crash loop hammering WhatsApp.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Give it a few seconds to close the WS cleanly on stop.
+TimeoutStopSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-whatsapp-http
+
+[Install]
+WantedBy=default.target
