@@ -1,13 +1,31 @@
 #!/usr/bin/env node
-// Standalone WhatsApp pairing — run from plugin dir for node_modules
-// Usage: cd ~/.claude/plugins/cache/nexus-plugins/whatsapp/0.0.1 && node ~/nexus/scripts/whatsapp-pair.cjs
+// Standalone WhatsApp pairing — run from a checkout that has node_modules.
+// Usage: WHATSAPP_STATE_DIR=~/.config/whatsapp-bridge node pair.cjs
 const qrcode = require("qrcode-terminal");
 const pino = require("pino");
 
+const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const STATE_DIR = (process.env.WHATSAPP_STATE_DIR || path.join(os.homedir(), ".claude", "channels", "whatsapp"))
-  .replace(/^~(?=\/|$)/, os.homedir());
+
+function resolveStateDir() {
+  const env = process.env.WHATSAPP_STATE_DIR;
+  if (env) return env.replace(/^~(?=\/|$)/, os.homedir());
+
+  const xdg = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  const next = path.join(xdg, "whatsapp-bridge");
+  const legacy = path.join(os.homedir(), ".claude", "channels", "whatsapp");
+
+  if (!fs.existsSync(next) && fs.existsSync(path.join(legacy, "auth", "creds.json"))) {
+    process.stderr.write(
+      `whatsapp pair: using legacy state dir ${legacy} — set WHATSAPP_STATE_DIR or move it to ${next}\n`
+    );
+    return legacy;
+  }
+  return next;
+}
+
+const STATE_DIR = resolveStateDir();
 const AUTH_DIR = path.join(STATE_DIR, "auth");
 
 console.log("WhatsApp pairing — auth dir:", AUTH_DIR);

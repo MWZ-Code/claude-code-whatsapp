@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * diag.cjs — Diagnostic tool for the WhatsApp MCP channel.
+ * diag.cjs — Diagnostic tool for the WhatsApp HTTP bridge.
  *
  * Validates channel configuration using test_access.json instead of the
- * production access.json.  Equivalent to running server.cjs with:
+ * production access.json.  Equivalent to running app.cjs with:
  *   WHATSAPP_ACCESS_FILE=<state_dir>/test_access.json
  *
  * Usage:
- *   node claude-code-whatsapp/diag.cjs
- *   WHATSAPP_STATE_DIR=~/.claude/channels/whatsapp node claude-code-whatsapp/diag.cjs
+ *   node diag.cjs
+ *   WHATSAPP_STATE_DIR=~/.config/whatsapp-bridge node diag.cjs
  *
  * Exit codes:
  *   0 — all checks passed (warnings allowed)
@@ -27,9 +27,21 @@ function expandHome(p) {
   return p.replace(/^~(?=\/|$)/, os.homedir());
 }
 
-const STATE_DIR = expandHome(
-  process.env.WHATSAPP_STATE_DIR || path.join(os.homedir(), ".claude", "channels", "whatsapp")
-);
+function resolveStateDir() {
+  const env = process.env.WHATSAPP_STATE_DIR;
+  if (env) return expandHome(env);
+
+  const xdg = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  const next = path.join(xdg, "whatsapp-bridge");
+  const legacy = path.join(os.homedir(), ".claude", "channels", "whatsapp");
+
+  if (!fs.existsSync(next) && fs.existsSync(path.join(legacy, "auth", "creds.json"))) {
+    return legacy;
+  }
+  return next;
+}
+
+const STATE_DIR = resolveStateDir();
 
 const TEST_ACCESS_FILE = path.join(STATE_DIR, "test_access.json");
 const AUTH_DIR         = path.join(STATE_DIR, "auth");
@@ -233,7 +245,7 @@ if (failCount > 0) {
 } else {
   console.log("PASS — all checks OK");
   console.log();
-  console.log("Run server.cjs with test access config:");
+  console.log("Run app.cjs with test access config:");
   console.log(
     `  WHATSAPP_STATE_DIR=${STATE_DIR} \\`
   );
@@ -241,7 +253,7 @@ if (failCount > 0) {
     `  WHATSAPP_ACCESS_FILE=${TEST_ACCESS_FILE} \\`
   );
   console.log(
-    `  node claude-code-whatsapp/server.cjs`
+    `  node app.cjs`
   );
   process.exit(0);
 }

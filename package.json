@@ -1,15 +1,28 @@
 {
-  "name": "claude-channel-whatsapp",
-  "version": "0.1.0",
+  "name": "whatsapp-bridge",
+  "version": "0.3.0",
   "license": "MIT",
-  "bin": "./server.cjs",
+  "bin": {
+    "whatsapp-bridge": "./app.cjs"
+  },
   "scripts": {
-    "start": "node server.cjs"
+    "build": "node scripts/build.cjs",
+    "build:watch": "node scripts/build.cjs --watch",
+    "typecheck": "tsc --noEmit",
+    "prestart": "npm run build",
+    "start": "node app.cjs",
+    "echo-bot": "node workers/echo_bot.cjs"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc.9",
     "link-preview-js": "^4.0.0",
     "pino": "^9.0.0",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "redis": "^4.7.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.17",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.9.3"
   }
 }
