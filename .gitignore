@@ -5,3 +5,5 @@ auth/
 .DS_Store
 bun.lock
 package-lock.json
+ideation/
+build/

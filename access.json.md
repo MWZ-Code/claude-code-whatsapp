@@ -1,14 +1,30 @@
 # access.json
 
-Channel access-control file consumed by `server.cjs`. Lives at
-`$WHATSAPP_STATE_DIR/access.json` (default: `~/.claude/channels/whatsapp/access.json`).
-Override the path with `WHATSAPP_ACCESS_FILE`.
+Channel access-control file consumed by `app.cjs`. Lives at
+`$WHATSAPP_STATE_DIR/access.json` (default:
+`${XDG_CONFIG_HOME:-~/.config}/whatsapp-bridge/access.json`; existing installs
+on the legacy `~/.claude/channels/whatsapp/access.json` still work — see the
+README for the back-compat resolution rules). Override the path with
+`WHATSAPP_ACCESS_FILE`.
 
-`server.cjs` re-reads this file on every inbound message — edits take effect
-without restarting the server. If the file is missing, the channel falls back
-to **open defaults** (all DMs accepted, all groups blocked). If the file is
-present but corrupt, the server renames it to `access.json.corrupt-<ts>` and
-also falls back to open defaults.
+`app.cjs` re-reads this file on every inbound message and on every
+outbound `/reply` or `/react` — edits take effect without restarting the
+server. If the file is missing, the channel falls back to **open defaults**
+(inbound: all DMs accepted, all groups blocked; outbound: any `chat_id`
+permitted). If the file is present but corrupt, the server renames it to
+`access.json.corrupt-<ts>` and also falls back to open defaults.
+
+## Outbound gating
+
+When `access.json` is **present**, the same allow-set used for inbound also
+gates outbound `/reply` and `/react`: the supplied `chat_id` must satisfy
+`allowGroups` / `allowedGroups` (for groups) or appear in `allowFrom` (for
+DMs, when `allowFrom` is non-empty). Calls to a non-permitted `chat_id`
+return `403 chat_id … not permitted by access.json`. `requireAllowFromInGroups`
+is inbound-only; it does not constrain who you can reply to.
+
+When `access.json` is **absent**, the send path stays wide open — existing
+installs without an access file keep working unchanged.
 
 ## Schema (5 keys, all optional)
 

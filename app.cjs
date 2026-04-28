@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 /**
- * WhatsApp channel for Claude Code — HTTP server
+ * WhatsApp HTTP bridge — standalone Baileys server with optional Redis
+ * Streams ingress publisher + egress consumer.
  *
- * Self-contained HTTP server using Baileys (WhatsApp Web Multi-Device).
- * Runs with Node.js CJS — Bun lacks WebSocket events Baileys requires.
+ * Two surfaces are exposed:
+ *   - HTTP API on loopback (POST /reply, /react, /download_attachment,
+ *     /fetch_messages; GET /health, /status). Existing contract.
+ *   - Redis Streams (additive, opt-in via subscribers.json):
+ *       whatsapp:raw     — every accepted inbound message (XADD)
+ *       whatsapp:egress  — outbound send queue consumed by this bridge
  *
- * Replaces the previous MCP-over-stdio transport. The four operations are
- * exposed as RPC-flat HTTP routes (POST /reply, POST /react,
- * POST /download_attachment, POST /fetch_messages) plus GET /health and
- * GET /status. Bind/port configurable via WHATSAPP_HTTP_BIND and
- * WHATSAPP_HTTP_PORT (default 127.0.0.1:8787).
+ * The Baileys send/receive paths are unchanged. Redis fan-out is bolted
+ * on via thin interfaces:
+ *   - rawPublisher.publish(envelope) is called after the existing
+ *     `messages.upsert` accept branch.
+ *   - egressBus → EgressConsumerBase → performSend() — the same
+ *     code path /reply and /react already use.
  *
  * Connection patterns based on OpenClaw's proven gateway:
  * - 515 is a normal restart request, not fatal
@@ -44,17 +50,52 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
+// Compiled TS modules. Built by `npm run build` (esbuild). Loaded lazily
+// so that pair.cjs and diag.cjs can require parts of this file's helpers
+// without forcing a build to be present first.
+function loadCompiled(rel) {
+  const p = path.join(__dirname, "build", rel);
+  if (!fs.existsSync(p)) {
+    throw new Error(
+      `compiled module not found: ${p}\n` +
+      `Run "npm run build" before starting the bridge.`
+    );
+  }
+  return require(p);
+}
+
 // ── Config ──────────────────────────────────────────────────────────
 
-const STATE_DIR = process.env.WHATSAPP_STATE_DIR || path.join(os.homedir(), ".claude", "channels", "whatsapp");
+function resolveStateDir() {
+  const env = process.env.WHATSAPP_STATE_DIR;
+  if (env) return env.replace(/^~(?=\/|$)/, os.homedir());
+
+  const xdg = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  const next = path.join(xdg, "whatsapp-bridge");
+  const legacy = path.join(os.homedir(), ".claude", "channels", "whatsapp");
+
+  if (!fs.existsSync(next) && fs.existsSync(path.join(legacy, "auth", "creds.json"))) {
+    process.stderr.write(
+      `whatsapp channel: using legacy state dir ${legacy} — set WHATSAPP_STATE_DIR or move it to ${next}\n`
+    );
+    return legacy;
+  }
+  return next;
+}
+
+const STATE_DIR = resolveStateDir();
 const ACCESS_FILE = process.env.WHATSAPP_ACCESS_FILE
   ? path.resolve(process.env.WHATSAPP_ACCESS_FILE.replace(/^~(?=\/|$)/, os.homedir()))
   : path.join(STATE_DIR, "access.json");
+const SUBSCRIBERS_FILE = process.env.WHATSAPP_SUBSCRIBERS_FILE
+  ? path.resolve(process.env.WHATSAPP_SUBSCRIBERS_FILE.replace(/^~(?=\/|$)/, os.homedir()))
+  : path.join(STATE_DIR, "subscribers.json");
 const AUTH_DIR = path.join(STATE_DIR, "auth");
 const INBOX_DIR = path.join(STATE_DIR, "inbox");
 const TRACE = process.env.WHATSAPP_TRACE === "1" || process.env.WHATSAPP_TRACE === "true";
 const HTTP_BIND = process.env.WHATSAPP_HTTP_BIND || "127.0.0.1";
 const HTTP_PORT = parseInt(process.env.WHATSAPP_HTTP_PORT || "8787", 10);
+const MAX_TEXT = parseInt(process.env.WHATSAPP_MAX_TEXT_CHARS || "4096", 10);
 
 fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
 fs.mkdirSync(INBOX_DIR, { recursive: true });
@@ -63,11 +104,51 @@ const logger = pino({ level: "silent" });
 const log = (msg) => process.stderr.write(`whatsapp channel: ${msg}\n`);
 const trace = TRACE ? (msg) => process.stderr.write(`whatsapp trace: ${msg}\n`) : () => {};
 
-// Reconnect policy (like OpenClaw)
 const RECONNECT = { initialMs: 2000, maxMs: 30000, factor: 1.8, jitter: 0.25 };
-const WATCHDOG_INTERVAL = 60 * 1000;     // check every 1 min
-const STALE_TIMEOUT = 30 * 60 * 1000;    // 30 min without messages = stale
-const HEALTHY_THRESHOLD = 60 * 1000;     // 60s connected = healthy (reset backoff)
+const WATCHDOG_INTERVAL = 60 * 1000;
+const STALE_TIMEOUT = 30 * 60 * 1000;
+const HEALTHY_THRESHOLD = 60 * 1000;
+
+// ── Subscribers config ──────────────────────────────────────────────
+
+function defaultSubscribers() {
+  return {
+    redis: { url: "redis://127.0.0.1:6379" },
+    streams: {
+      raw: { enabled: false, key: "whatsapp:raw", maxLen: 10000 },
+      egress: { enabled: false, key: "whatsapp:egress", consumerGroup: "bridge" },
+    },
+    egress: {
+      idempotencyLruSize: 30,
+      retry: { maxAttempts: 5, queueMaxPerChat: 100 },
+    },
+  };
+}
+
+function loadSubscribers() {
+  const cfg = defaultSubscribers();
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SUBSCRIBERS_FILE, "utf8"));
+    deepMerge(cfg, parsed);
+    log(`subscribers: loaded ${SUBSCRIBERS_FILE}`);
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      log(`subscribers: failed to read ${SUBSCRIBERS_FILE}: ${err.message} — using defaults`);
+    }
+  }
+  return cfg;
+}
+
+function deepMerge(target, src) {
+  for (const k of Object.keys(src)) {
+    if (src[k] && typeof src[k] === "object" && !Array.isArray(src[k])) {
+      target[k] = target[k] && typeof target[k] === "object" ? target[k] : {};
+      deepMerge(target[k], src[k]);
+    } else {
+      target[k] = src[k];
+    }
+  }
+}
 
 // ── Access Control ──────────────────────────────────────────────────
 
@@ -77,16 +158,18 @@ function defaultAccess() {
 
 function loadAccess() {
   let access;
+  let present = false;
   try {
     const parsed = JSON.parse(fs.readFileSync(ACCESS_FILE, "utf8"));
     access = { ...defaultAccess(), ...parsed };
+    present = true;
   } catch (err) {
     if (err.code !== "ENOENT") {
       try { fs.renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`); } catch {}
     }
     access = defaultAccess();
   }
-  // Compile mentionKey regex once; fall back to null on invalid pattern
+  access._present = present;
   if (access.mentionKey && typeof access.mentionKey === "string") {
     try {
       access._mentionRe = new RegExp(access.mentionKey, "i");
@@ -102,40 +185,6 @@ function loadAccess() {
   return access;
 }
 
-function toJid(phone) {
-  if (phone.includes("@")) return phone;
-  return `${phone.replace(/[^0-9]/g, "")}@s.whatsapp.net`;
-}
-
-function isAllowed(access, jid, participant) {
-  const isGroup = jid.endsWith("@g.us");
-  if (isGroup) {
-    if (!access.allowGroups) return false;
-    if (access.allowedGroups.length > 0 && !access.allowedGroups.includes(jid)) return false;
-    if (access.requireAllowFromInGroups && participant) {
-      return access.allowFrom.some((a) => toJid(a) === participant || a === participant);
-    }
-    return true;
-  }
-  if (access.allowFrom.length === 0) return true;
-  return access.allowFrom.some((a) => toJid(a) === jid || a === jid);
-}
-
-// ── Path safety ─────────────────────────────────────────────────────
-
-function assertSendable(f) {
-  try {
-    const real = fs.realpathSync(f);
-    const stateReal = fs.realpathSync(STATE_DIR);
-    const inbox = path.join(stateReal, "inbox");
-    if (real.startsWith(stateReal + path.sep) && !real.startsWith(inbox + path.sep)) {
-      throw new Error(`refusing to send channel state: ${f}`);
-    }
-  } catch (e) {
-    if (e.message?.startsWith("refusing")) throw e;
-  }
-}
-
 // ── Message caches ──────────────────────────────────────────────────
 
 const rawMessages = new Map();
@@ -144,16 +193,8 @@ const recentMessages = new Map();
 const MAX_RECENT = 100;
 const seenMessages = new Map();
 
-// Server-side delivery cursor — tracks the last arrivedAt timestamp delivered
-// to the bot via fetch_messages, per chat. Only messages arriving AFTER the
-// cursor are returned on each call, eliminating reliance on Claude's in-context
-// deduplication (which breaks after context compression).
 const lastDeliveredAt = new Map();
 
-// Ring buffer of IDs for messages sent by the bot via the reply tool.
-// Entries are excluded from fetch_messages results to prevent echo loops.
-// fromMe already blocks these from entering recentMessages, but this is an
-// explicit guard that survives any Baileys edge-cases around that flag.
 const SENT_RING_CAP = 300;
 const _sentRing = new Array(SENT_RING_CAP).fill(null);
 const _sentSet = new Set();
@@ -198,19 +239,19 @@ function storeRecent(chatId, entry) {
   if (arr.length > MAX_RECENT) arr.shift();
 }
 
-// ── Creds backup/restore (like OpenClaw) ────────────────────────────
+// ── Creds backup/restore ────────────────────────────────────────────
 
 function maybeRestoreCredsFromBackup() {
   const credsPath = path.join(AUTH_DIR, "creds.json");
   const backupPath = path.join(AUTH_DIR, "creds.json.bak");
   try {
     const raw = fs.readFileSync(credsPath, "utf8");
-    JSON.parse(raw); // validate
-    return; // creds valid
+    JSON.parse(raw);
+    return;
   } catch {}
   try {
     const backup = fs.readFileSync(backupPath, "utf8");
-    JSON.parse(backup); // validate backup
+    JSON.parse(backup);
     fs.copyFileSync(backupPath, credsPath);
     try { fs.chmodSync(credsPath, 0o600); } catch {}
     log("restored creds.json from backup");
@@ -224,12 +265,11 @@ function enqueueSaveCreds() {
   if (!saveCreds) return;
   credsSaveQueue = credsSaveQueue
     .then(() => {
-      // Backup before save
       const credsPath = path.join(AUTH_DIR, "creds.json");
       const backupPath = path.join(AUTH_DIR, "creds.json.bak");
       try {
         const raw = fs.readFileSync(credsPath, "utf8");
-        JSON.parse(raw); // validate before backing up
+        JSON.parse(raw);
         fs.copyFileSync(credsPath, backupPath);
         try { fs.chmodSync(backupPath, 0o600); } catch {}
       } catch {}
@@ -253,6 +293,13 @@ let connectedAt = 0;
 let lastInboundAt = 0;
 let watchdogTimer = null;
 
+// Hooks fired by messages.upsert when a message has passed all filters.
+// app.cjs registers a single hook that publishes to Redis (if configured).
+const acceptedMessageHandlers = [];
+function onAcceptedMessage(handler) {
+  acceptedMessageHandlers.push(handler);
+}
+
 function computeDelay(attempt) {
   const base = Math.min(RECONNECT.initialMs * Math.pow(RECONNECT.factor, attempt), RECONNECT.maxMs);
   const jitter = base * RECONNECT.jitter * (Math.random() * 2 - 1);
@@ -270,10 +317,7 @@ function cleanupSocket() {
 }
 
 async function connectWhatsApp() {
-  // Cleanup previous socket completely (like OpenClaw — new socket each time)
   cleanupSocket();
-
-  // Restore creds from backup if corrupted
   maybeRestoreCredsFromBackup();
 
   let authState, version;
@@ -300,7 +344,6 @@ async function connectWhatsApp() {
     browser: ["Mac OS", "Safari", "1.0.0"],
     syncFullHistory: false,
     markOnlineOnConnect: false,
-    // getMessage handler (required for E2EE retry in Baileys)
     getMessage: async (key) => {
       const cached = rawMessages.get(key.id);
       if (cached?.message) return cached.message;
@@ -324,38 +367,28 @@ async function connectWhatsApp() {
       connectionReady = false;
       const reason = lastDisconnect?.error?.output?.statusCode;
 
-      // 440 = session conflict — another device replaced. Stop permanently.
       if (reason === 440) {
         log("session conflict (440) — another device replaced this connection. Re-link required.");
-        return; // stop, don't reconnect
+        return;
       }
-
-      // 401 = logged out — creds invalidated
       if (reason === DisconnectReason.loggedOut) {
         log("logged out (401) — session invalidated. Re-pair needed.");
-        return; // stop, don't reconnect (user must re-pair)
+        return;
       }
-
-      // 515 = restart requested by WhatsApp — NORMAL event, reconnect quickly
       if (reason === 515) {
         log("WhatsApp requested restart (515). Reconnecting in 2s...");
         setTimeout(connectWhatsApp, 2000);
         return;
       }
-
-      // Reset backoff if connection was healthy (>60s uptime)
       if (connectedAt && Date.now() - connectedAt > HEALTHY_THRESHOLD) {
         retryCount = 0;
       }
-
-      // Max retries reached — wait longer then reset (never exit!)
       if (retryCount >= 15) {
         log("max retries reached. Waiting 5 min before resetting...");
         retryCount = 0;
         setTimeout(connectWhatsApp, 5 * 60 * 1000);
         return;
       }
-
       const delay = computeDelay(retryCount);
       retryCount++;
       log(`connection closed (${reason}), retrying in ${delay}ms (attempt ${retryCount})`);
@@ -368,7 +401,6 @@ async function connectWhatsApp() {
       retryCount = 0;
       log("connected");
 
-      // Start watchdog — detect stale connections
       if (watchdogTimer) clearInterval(watchdogTimer);
       watchdogTimer = setInterval(() => {
         if (!connectionReady) return;
@@ -380,13 +412,11 @@ async function connectWhatsApp() {
     }
   });
 
-  // WebSocket error handler
   if (sock.ws && typeof sock.ws.on === "function") {
     sock.ws.on("error", (err) => log(`WebSocket error: ${err}`));
   }
 
-  // Message handler
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+  sock.ev.on("messages.upsert", async ({ messages }) => {
     for (const msg of messages) {
       if (!msg.message) continue;
 
@@ -394,34 +424,33 @@ async function connectWhatsApp() {
       const jid = msg.key.remoteJid;
       if (!jid) continue;
       const participant = msg.key.participant;
+      const text = extractText(msg.message);
 
       if (TRACE) {
         const kind = jid.endsWith("@g.us") ? "group"
           : jid.endsWith("@broadcast") ? "broadcast"
           : jid.endsWith("@status") ? "status"
           : "dm";
-        const preview = extractText(msg.message).slice(0, 80).replace(/\s+/g, " ");
+        const preview = text.slice(0, 80).replace(/\s+/g, " ");
         const who = participant ? ` participant=${participant}` : "";
         const self = msg.key.fromMe ? " (self)" : "";
         trace(`inbound${self} ${kind} jid=${jid}${who} id=${msgId} text=${JSON.stringify(preview)}`);
       }
 
-      // Skip only messages the bot itself sent (tracked in _sentSet).
-      // Do NOT do a blanket fromMe filter — WZ messages from their own phone
-      // also arrive as fromMe:true on a linked-device session.
-      if (msg.key.fromMe && msgId && _sentSet.has(msgId)) { trace("  drop: bot's own reply"); continue; }
-
-      if (jid.endsWith("@broadcast") || jid.endsWith("@status")) { trace("  drop: broadcast/status"); continue; }
-
-      if (msgId && isDuplicate(`${jid}:${msgId}`)) { trace("  drop: duplicate within dedup window"); continue; }
-
       const access = loadAccess();
-      if (!isAllowed(access, jid, participant || undefined)) { trace("  drop: blocked by access.json"); continue; }
-
-      // Mention-key filter: group messages must match the regex (case-insensitive)
-      if (jid.endsWith("@g.us") && access._mentionRe) {
-        const text = extractText(msg.message);
-        if (!access._mentionRe.test(text)) { trace("  drop: mentionKey regex no match"); continue; }
+      const check = middleware.checkInbound({
+        jid,
+        participant: participant || undefined,
+        msgId,
+        text,
+        fromMe: !!msg.key.fromMe,
+        isOwnSentId: (id) => _sentSet.has(id),
+        isDuplicate,
+        access,
+      });
+      if (!check.ok) {
+        trace(`  drop: ${check.reason}`);
+        continue;
       }
 
       trace("  accept");
@@ -429,7 +458,19 @@ async function connectWhatsApp() {
 
       lastInboundAt = Date.now();
       storeRaw(msg);
-      handleInbound(msg, jid, participant || undefined);
+      const accepted = handleInbound(msg, jid, participant || undefined);
+
+      // Fan out to registered handlers (e.g. raw publisher). Run in
+      // parallel; a slow / failing handler must never block the WA loop.
+      if (acceptedMessageHandlers.length > 0) {
+        Promise.allSettled(
+          acceptedMessageHandlers.map((h) => Promise.resolve().then(() => h(accepted)))
+        ).then((results) => {
+          for (const r of results) {
+            if (r.status === "rejected") log(`accepted-message handler error: ${r.reason}`);
+          }
+        });
+      }
     }
   });
 }
@@ -478,17 +519,100 @@ function handleInbound(msg, jid, participant) {
   const msgId = msg.key.id || `${Date.now()}`;
   const senderJid = participant || jid;
   const senderNumber = formatJid(senderJid);
-
   const arrivedAt = Date.now();
-  storeRecent(jid, {
+  const ts = (Number(msg.messageTimestamp) || Date.now() / 1000) * 1000;
+
+  const entry = {
     id: msgId,
     from: senderNumber,
     text: text || (media ? `(${media.type})` : ""),
-    ts: (Number(msg.messageTimestamp) || Date.now() / 1000) * 1000,
+    ts,
     arrivedAt,
     hasMedia: !!media,
     mediaType: media?.type,
-  });
+  };
+  storeRecent(jid, entry);
+
+  // Normalised envelope handed to onAcceptedMessage handlers.
+  return {
+    channel: "whatsapp",
+    id: msgId,
+    jid,
+    participant: participant || null,
+    from: senderNumber,
+    text: entry.text,
+    ts,
+    arrivedAt,
+    hasMedia: !!media,
+    mediaType: media?.type ?? null,
+    key: {
+      remoteJid: msg.key.remoteJid,
+      fromMe: !!msg.key.fromMe,
+      id: msg.key.id,
+    },
+  };
+}
+
+// ── Send path (single source of truth) ──────────────────────────────
+
+// performSend assumes middleware.checkEgress has already passed. Both
+// the HTTP route handlers and the egress consumer reach Baileys through
+// this function.
+async function performSend(payload) {
+  requireConnected();
+  const { op, chat_id } = payload;
+
+  if (op === "react") {
+    await sock.sendMessage(chat_id, {
+      react: { text: payload.emoji, key: { remoteJid: chat_id, id: payload.message_id } },
+    });
+    return { reacted: true };
+  }
+
+  // op === "reply"
+  const text = payload.text;
+  const files = payload.files || [];
+  const quoted = payload.reply_to ? rawMessages.get(payload.reply_to) : undefined;
+
+  if (payload.edit) {
+    const editKey = { remoteJid: chat_id, fromMe: true, id: payload.edit };
+    await sock.sendMessage(chat_id, { text, edit: editKey });
+    return { edited_id: payload.edit };
+  }
+
+  let sentId = null;
+  if (text) {
+    const sent = await sock.sendMessage(chat_id, { text }, quoted ? { quoted } : undefined);
+    sentId = sent?.key?.id ?? null;
+    if (sentId && !payload.agent_message) {
+      trackSentId(sentId);
+    } else if (sentId && payload.agent_message) {
+      storeRecent(chat_id, {
+        id: sentId,
+        from: "bot",
+        text,
+        ts: Date.now(),
+        hasMedia: false,
+        mediaType: undefined,
+      });
+    }
+  }
+  for (const f of files) {
+    const ext = path.extname(f).toLowerCase();
+    const buf = fs.readFileSync(f);
+    if (payload.send_as_document === true) {
+      await sock.sendMessage(chat_id, { document: buf, mimetype: "image/png", fileName: path.basename(f) });
+    } else if ([".jpg", ".jpeg", ".png", ".gif", ".webp"].includes(ext)) {
+      await sock.sendMessage(chat_id, { image: buf });
+    } else if ([".ogg", ".mp3", ".m4a", ".wav"].includes(ext)) {
+      await sock.sendMessage(chat_id, { audio: buf, mimetype: ext === ".ogg" ? "audio/ogg; codecs=opus" : "audio/mpeg", ptt: ext === ".ogg" });
+    } else if ([".mp4", ".mov", ".avi"].includes(ext)) {
+      await sock.sendMessage(chat_id, { video: buf });
+    } else {
+      await sock.sendMessage(chat_id, { document: buf, mimetype: "application/octet-stream", fileName: path.basename(f) });
+    }
+  }
+  return { sent_id: sentId };
 }
 
 // ── HTTP handlers ───────────────────────────────────────────────────
@@ -535,75 +659,61 @@ function requireConnected() {
   if (!sock || !connectionReady) throw httpError(503, "WhatsApp not connected");
 }
 
+function middlewareErrorToHttp(reason) {
+  if (!reason) return httpError(400, "rejected");
+  if (reason.includes("not permitted")) return httpError(403, reason);
+  if (reason.startsWith("text too long")) return httpError(413, reason);
+  if (reason.includes("file too large") || reason.startsWith("unsafe file path") || reason.startsWith("file not readable")) {
+    return httpError(400, reason);
+  }
+  return httpError(400, reason);
+}
+
 async function handleReply(args) {
   requireConnected();
-  const chatId = args.chat_id;
-  const text = args.text;
-  const files = args.files || [];
-  if (!chatId) throw httpError(400, "chat_id required");
-  for (const f of files) {
-    assertSendable(f);
-    if (fs.statSync(f).size > 64 * 1024 * 1024) throw new Error(`file too large: ${f}`);
-  }
-  const quoted = args.reply_to ? rawMessages.get(args.reply_to) : undefined;
-  const MAX_TEXT = parseInt(process.env.WHATSAPP_MAX_TEXT_CHARS || "4096", 10);
-  if (text && text.length > MAX_TEXT && !args.agent_message) {
-    throw httpError(413, `text too long: ${text.length} chars (limit ${MAX_TEXT}). Use render_report.py and send as document instead.`);
-  }
-  // Edit path: update an existing bot message instead of sending new.
-  if (args.edit) {
-    const editKey = { remoteJid: chatId, fromMe: true, id: args.edit };
-    await sock.sendMessage(chatId, { text, edit: editKey });
-    return { edited_id: args.edit };
-  }
-
-  let sentId = null;
-  if (text) {
-    const sent = await sock.sendMessage(chatId, { text }, quoted ? { quoted } : undefined);
-    sentId = sent?.key?.id ?? null;
-    if (sentId && !args.agent_message) {
-      trackSentId(sentId);
-    } else if (sentId && args.agent_message) {
-      // Store directly in recentMessages so fetch_messages can observe it
-      // (fromMe=true messages are skipped by the Baileys event handler, so
-      //  we inject the entry here for round-trip / diagnostic testing)
-      storeRecent(chatId, {
-        id: sentId,
-        from: "bot",
-        text,
-        ts: Date.now(),
-        hasMedia: false,
-        mediaType: undefined,
-      });
-    }
-  }
-  for (const f of files) {
-    const ext = path.extname(f).toLowerCase();
-    const buf = fs.readFileSync(f);
-    if (args.send_as_document === true) {
-      await sock.sendMessage(chatId, { document: buf, mimetype: "image/png", fileName: path.basename(f) });
-    } else if ([".jpg", ".jpeg", ".png", ".gif", ".webp"].includes(ext)) {
-      await sock.sendMessage(chatId, { image: buf });
-    } else if ([".ogg", ".mp3", ".m4a", ".wav"].includes(ext)) {
-      await sock.sendMessage(chatId, { audio: buf, mimetype: ext === ".ogg" ? "audio/ogg; codecs=opus" : "audio/mpeg", ptt: ext === ".ogg" });
-    } else if ([".mp4", ".mov", ".avi"].includes(ext)) {
-      await sock.sendMessage(chatId, { video: buf });
-    } else {
-      await sock.sendMessage(chatId, { document: buf, mimetype: "application/octet-stream", fileName: path.basename(f) });
-    }
-  }
-  return { sent_id: sentId };
+  const access = loadAccess();
+  const check = middleware.checkEgress({
+    op: "reply",
+    chat_id: args.chat_id,
+    text: args.text,
+    files: args.files,
+    access,
+    maxTextChars: MAX_TEXT,
+    stateDir: STATE_DIR,
+    agent_message: args.agent_message,
+  });
+  if (!check.ok) throw middlewareErrorToHttp(check.reason);
+  return performSend({
+    op: "reply",
+    chat_id: args.chat_id,
+    text: args.text,
+    files: args.files,
+    reply_to: args.reply_to,
+    edit: args.edit,
+    send_as_document: args.send_as_document,
+    agent_message: args.agent_message,
+  });
 }
 
 async function handleReact(args) {
   requireConnected();
-  if (!args.chat_id || !args.message_id || !args.emoji) {
-    throw httpError(400, "chat_id, message_id, emoji required");
-  }
-  await sock.sendMessage(args.chat_id, {
-    react: { text: args.emoji, key: { remoteJid: args.chat_id, id: args.message_id } },
+  const access = loadAccess();
+  const check = middleware.checkEgress({
+    op: "react",
+    chat_id: args.chat_id,
+    message_id: args.message_id,
+    emoji: args.emoji,
+    access,
+    maxTextChars: MAX_TEXT,
+    stateDir: STATE_DIR,
   });
-  return { reacted: true };
+  if (!check.ok) throw middlewareErrorToHttp(check.reason);
+  return performSend({
+    op: "react",
+    chat_id: args.chat_id,
+    message_id: args.message_id,
+    emoji: args.emoji,
+  });
 }
 
 async function handleDownloadAttachment(args) {
@@ -652,6 +762,7 @@ function handleStatus() {
     last_inbound_at: lastInboundAt || null,
     retry_count: retryCount,
     watchdog_age_ms: lastInboundAt ? Date.now() - lastInboundAt : null,
+    subscribers: subscribersStatus(),
   };
 }
 
@@ -692,9 +803,88 @@ const server = http.createServer((req, res) => {
   });
 });
 
+// ── Subscribers (raw publisher + egress consumer) ───────────────────
+
+let middleware;
+let rawPublisher = null;
+let egressBus = null;
+let egressConsumer = null;
+
+function subscribersStatus() {
+  return {
+    raw: rawPublisher
+      ? { enabled: true, ...rawPublisher.stats() }
+      : { enabled: false },
+    egress: egressBus
+      ? {
+          enabled: true,
+          dropped_middleware: egressConsumer?.droppedMiddleware ?? 0,
+          dropped_duplicate: egressConsumer?.droppedDuplicate ?? 0,
+          dropped_retry_exhausted: egressConsumer?.droppedRetryExhausted ?? 0,
+          dropped_queue_full: egressConsumer?.droppedQueueFull ?? 0,
+        }
+      : { enabled: false },
+  };
+}
+
+async function bootSubscribers() {
+  const cfg = loadSubscribers();
+
+  if (cfg.streams.raw.enabled) {
+    const { RawPublisher } = loadCompiled("streams/Redis/raw_publisher.js");
+    rawPublisher = new RawPublisher(
+      { url: cfg.redis.url, streamKey: cfg.streams.raw.key, maxLen: cfg.streams.raw.maxLen },
+      log,
+    );
+    onAcceptedMessage((envelope) => rawPublisher.publish(envelope));
+    log(`raw publisher: enabled stream="${cfg.streams.raw.key}" maxLen=${cfg.streams.raw.maxLen}`);
+  }
+
+  if (cfg.streams.egress.enabled) {
+    const { EgressBus } = loadCompiled("streams/Redis/egress_bus.js");
+    const { EgressConsumerBase } = loadCompiled("channels/WhatsApp/egress_consumer_base.js");
+
+    egressConsumer = new EgressConsumerBase({
+      send: (sendPayload) => performSend(sendPayload),
+      middleware: (m) => middleware.checkEgress({
+        op: m.op,
+        chat_id: m.chat_id,
+        text: m.text,
+        files: m.files,
+        emoji: m.emoji,
+        message_id: m.message_id,
+        access: loadAccess(),
+        maxTextChars: MAX_TEXT,
+        stateDir: STATE_DIR,
+      }),
+      idempotencyLruSize: cfg.egress.idempotencyLruSize,
+      maxAttempts: cfg.egress.retry.maxAttempts,
+      queueMaxPerChat: cfg.egress.retry.queueMaxPerChat,
+      log: (m) => process.stderr.write(`egress consumer: ${m}\n`),
+    });
+
+    egressBus = new EgressBus({
+      url: cfg.redis.url,
+      streamKey: cfg.streams.egress.key,
+      consumerGroup: cfg.streams.egress.consumerGroup,
+    }, log);
+
+    await egressBus.start(async (msg, ack) => {
+      const payload = msg.payload;
+      if (!payload || typeof payload !== "object" || payload.channel !== "whatsapp") {
+        log(`egress: dropping non-whatsapp payload id=${msg.id}`);
+        await ack();
+        return;
+      }
+      await egressConsumer.dispatch(payload, ack);
+    });
+
+    log(`egress consumer: enabled stream="${cfg.streams.egress.key}" group="${cfg.streams.egress.consumerGroup}"`);
+  }
+}
+
 // ── Startup ─────────────────────────────────────────────────────────
 
-// Baileys crypto errors → reconnect instead of crash (like OpenClaw)
 process.on("unhandledRejection", (err) => {
   const msg = String(err).toLowerCase();
   if (
@@ -720,6 +910,8 @@ function shutdown() {
   shuttingDown = true;
   log("shutting down");
   try { server.close(); } catch {}
+  if (egressBus) { egressBus.stop().catch(() => {}); }
+  if (egressConsumer) { egressConsumer.shutdown(); }
   cleanupSocket();
   setTimeout(() => process.exit(0), 2000);
 }
@@ -727,6 +919,7 @@ process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
 async function main() {
+  middleware = loadCompiled("channels/WhatsApp/middleware.js");
   await loadBaileys();
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -736,6 +929,11 @@ async function main() {
       resolve();
     });
   });
+  try {
+    await bootSubscribers();
+  } catch (err) {
+    log(`subscribers boot failed: ${err.message ?? err} — bridge continues without Redis`);
+  }
   connectWhatsApp();
 }
 

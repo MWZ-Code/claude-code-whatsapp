@@ -1,0 +1,24 @@
+{
+  "redis": {
+    "url": "redis://127.0.0.1:6379"
+  },
+  "streams": {
+    "raw": {
+      "enabled": true,
+      "key": "whatsapp:raw",
+      "maxLen": 10000
+    },
+    "egress": {
+      "enabled": true,
+      "key": "whatsapp:egress",
+      "consumerGroup": "bridge"
+    }
+  },
+  "egress": {
+    "idempotencyLruSize": 30,
+    "retry": {
+      "maxAttempts": 5,
+      "queueMaxPerChat": 100
+    }
+  }
+}

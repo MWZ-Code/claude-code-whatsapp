@@ -1,20 +1,20 @@
 ---
 name: whatsapp-channel
 description: >
-  Talk to a paired WhatsApp account through the local claude-whatsapp-http
-  HTTP server. Use this skill whenever you need to fetch new inbound WhatsApp
-  messages, send a reply, edit a previously sent reply, react to a message,
-  or download an attachment. The transport is plain HTTP on loopback —
-  polling-based, no MCP, no push notifications, no webhook. Trigger this
-  skill any time the user mentions WhatsApp, the bot, replying to a chat,
-  fetching messages, or any of the routes listed below.
+  Talk to a paired WhatsApp account through the local whatsapp-http bridge.
+  Use this skill whenever you need to fetch new inbound WhatsApp messages,
+  send a reply, edit a previously sent reply, react to a message, or download
+  an attachment. The transport is plain HTTP on loopback — polling-based, no
+  MCP, no push notifications, no webhook. Trigger this skill any time the
+  user mentions WhatsApp, the bot, replying to a chat, fetching messages, or
+  any of the routes listed below.
 user-invocable: false
 ---
 
 # WhatsApp Channel (HTTP)
 
-The WhatsApp channel runs as its own long-lived process
-(`claude-whatsapp-http.service`, see `deploy/`) and exposes an RPC-flat HTTP
+The WhatsApp bridge runs as its own long-lived process
+(`whatsapp-http.service`, see `deploy/`) and exposes an RPC-flat HTTP
 API on `127.0.0.1:8787` (override with `WHATSAPP_HTTP_BIND` /
 `WHATSAPP_HTTP_PORT`). All operations are `curl`-friendly. There is no auth on
 the loopback interface and no push channel — **this is polling-based. No push
@@ -33,7 +33,7 @@ choosing.
   and retry. `/health` and `/status` always succeed.
 - The HTTP server may not be running. A connection-refused / ECONNREFUSED
   error means the systemd unit is down — surface it to the user and stop the
-  current task; do not try to recover the channel from this layer.
+  current task; do not try to recover the bridge from this layer.
 
 ## Endpoints
 
@@ -198,7 +198,7 @@ Response:
 
 ```json
 {
-  "file_path": "/home/user/.claude/channels/whatsapp/inbox/1730000000000-photo.jpg",
+  "file_path": "/home/user/.config/whatsapp-bridge/inbox/1730000000000-photo.jpg",
   "type": "image",
   "size_bytes": 184321
 }
@@ -271,7 +271,7 @@ Schema (see `access.json.md` in this repo for the full reference):
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `connection refused` on every call | systemd unit not running. | `systemctl --user start claude-whatsapp-http.service`, then check `journalctl --user -u claude-whatsapp-http.service`. |
+| `connection refused` on every call | systemd unit not running. | `systemctl --user start whatsapp-http.service`, then check `journalctl --user -u whatsapp-http.service`. |
 | `503 WhatsApp not connected` after the unit restarts | Baileys still reconnecting. | Wait, then poll `/status` until `connected: true`. |
 | `404 message not found in cache` | Message ID is older than the 500-entry raw buffer or never arrived this process lifetime. | The attachment is unrecoverable from this layer; ask the sender to resend. |
 | `413 text too long` on `/reply` | Text exceeds `WHATSAPP_MAX_TEXT_CHARS`. | Render to a file (e.g. via `tools/render_report.py`) and re-`/reply` with `files=[<path>], send_as_document=true`. |
